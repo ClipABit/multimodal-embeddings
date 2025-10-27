@@ -62,16 +62,26 @@ if 'models_loaded' not in st.session_state:
 @st.cache_resource
 def load_clip_model():
     """Load CLIP model for image+text embeddings"""
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    return model, processor
+    try:
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        return model, processor
+    except Exception as e:
+        st.error(f"Failed to load CLIP model: {e}")
+        st.info("Please ensure you have internet connection for first-time model download")
+        raise
 
 
 @st.cache_resource
 def load_text_model():
     """Load text embedding model"""
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    return model
+    try:
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        return model
+    except Exception as e:
+        st.error(f"Failed to load text model: {e}")
+        st.info("Please ensure you have internet connection for first-time model download")
+        raise
 
 
 def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List[np.ndarray]]]:
@@ -326,144 +336,152 @@ if uploaded_file is not None:
     if st.button("🚀 Process Video with All Methods", type="primary"):
         st.header("2. Processing Video")
         
-        # Extract frames
-        with st.spinner("Extracting video frames..."):
-            chunks, fps, duration = extract_frames(video_path, chunk_duration)
-            st.success(f"Extracted {len(chunks)} chunks of {chunk_duration}s each")
-        
-        # Load models
-        with st.spinner("Loading models..."):
-            clip_model, clip_processor = load_clip_model()
-            text_model = load_text_model()
-            st.success("Models loaded successfully")
-        
-        # Create tabs for each method
-        st.header("3. Processing with Different Methods")
-        
-        results = []
-        all_embeddings = []
-        all_metrics = []
-        
-        # Method A
-        with st.spinner("Processing Method A: Image + Text (CLIP)..."):
-            embeddings_a, metrics_a = method_a_image_text_embedding(
-                chunks, clip_model, clip_processor, device
-            )
-            all_embeddings.append(embeddings_a)
-            all_metrics.append(metrics_a)
-            st.success(f"Method A completed in {metrics_a['processing_time']:.2f}s")
-        
-        # Method B
-        with st.spinner("Processing Method B: Video + Text (Multi-frame)..."):
-            embeddings_b, metrics_b = method_b_video_text_embedding(chunks, device)
-            all_embeddings.append(embeddings_b)
-            all_metrics.append(metrics_b)
-            st.success(f"Method B completed in {metrics_b['processing_time']:.2f}s")
-        
-        # Method C
-        with st.spinner("Processing Method C: LLM Description + Text..."):
-            embeddings_c, metrics_c = method_c_llm_text_embedding(chunks, text_model, device)
-            all_embeddings.append(embeddings_c)
-            all_metrics.append(metrics_c)
-            st.success(f"Method C completed in {metrics_c['processing_time']:.2f}s")
-        
-        # Display results
-        st.header("4. Performance Comparison")
-        
-        # Create metrics dataframe
-        df_metrics = pd.DataFrame(all_metrics)
-        
-        # Display metrics table
-        st.subheader("Processing Metrics")
-        st.dataframe(df_metrics, use_container_width=True)
-        
-        # Visualize metrics
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric(
-                "Method A: Processing Time",
-                f"{metrics_a['processing_time']:.2f}s",
-                delta=None
-            )
-            st.metric(
-                "Avg Time/Chunk",
-                f"{metrics_a['avg_time_per_chunk']:.3f}s"
-            )
-        
-        with col2:
-            st.metric(
-                "Method B: Processing Time",
-                f"{metrics_b['processing_time']:.2f}s",
-                delta=f"{metrics_b['processing_time'] - metrics_a['processing_time']:.2f}s"
-            )
-            st.metric(
-                "Avg Time/Chunk",
-                f"{metrics_b['avg_time_per_chunk']:.3f}s"
-            )
-        
-        with col3:
-            st.metric(
-                "Method C: Processing Time",
-                f"{metrics_c['processing_time']:.2f}s",
-                delta=f"{metrics_c['processing_time'] - metrics_a['processing_time']:.2f}s"
-            )
-            st.metric(
-                "Avg Time/Chunk",
-                f"{metrics_c['avg_time_per_chunk']:.3f}s"
-            )
-        
-        # Embedding quality metrics
-        st.subheader("Embedding Quality Metrics")
-        
-        similarities = compute_embedding_similarity(all_embeddings)
-        
-        quality_df = pd.DataFrame({
-            'Method': [m['method'] for m in all_metrics],
-            'Embedding Dimension': [m['embedding_dim'] for m in all_metrics],
-            'Avg Chunk Similarity': similarities
-        })
-        
-        st.dataframe(quality_df, use_container_width=True)
-        
-        st.info("""
-        **Interpretation:**
-        - **Processing Time**: Lower is faster
-        - **Embedding Dimension**: Higher may capture more information but uses more memory
-        - **Avg Chunk Similarity**: Measures consistency between consecutive chunks (0-1 scale)
-        """)
-        
-        # Summary
-        st.header("5. Summary & Recommendations")
-        
-        fastest_method = min(all_metrics, key=lambda x: x['processing_time'])
-        
-        st.success(f"**Fastest Method**: {fastest_method['method']} ({fastest_method['processing_time']:.2f}s)")
-        
-        st.markdown("""
-        ### Method Comparison:
-        
-        **Method A (Image + Text - CLIP)**
-        - ✅ Fast processing with sampled frames
-        - ✅ Good for static visual content
-        - ⚠️ May miss temporal dynamics
-        
-        **Method B (Video + Text - Multi-frame)**
-        - ✅ Better temporal understanding
-        - ✅ Captures motion and sequences
-        - ⚠️ Slower due to processing more frames
-        
-        **Method C (LLM Description + Text)**
-        - ✅ Fastest processing
-        - ✅ Semantic understanding through descriptions
-        - ⚠️ Quality depends on description accuracy (simplified in this demo)
-        """)
-        
-        # Cleanup
         try:
-            os.unlink(video_path)
-        except:
-            pass
+            # Extract frames
+            with st.spinner("Extracting video frames..."):
+                chunks, fps, duration = extract_frames(video_path, chunk_duration)
+                st.success(f"Extracted {len(chunks)} chunks of {chunk_duration}s each")
+            
+            # Load models
+            with st.spinner("Loading models..."):
+                clip_model, clip_processor = load_clip_model()
+                text_model = load_text_model()
+                st.success("Models loaded successfully")
+            
+            # Create tabs for each method
+            st.header("3. Processing with Different Methods")
+            
+            results = []
+            all_embeddings = []
+            all_metrics = []
+            
+            # Method A
+            with st.spinner("Processing Method A: Image + Text (CLIP)..."):
+                embeddings_a, metrics_a = method_a_image_text_embedding(
+                    chunks, clip_model, clip_processor, device
+                )
+                all_embeddings.append(embeddings_a)
+                all_metrics.append(metrics_a)
+                st.success(f"Method A completed in {metrics_a['processing_time']:.2f}s")
+            
+            # Method B
+            with st.spinner("Processing Method B: Video + Text (Multi-frame)..."):
+                embeddings_b, metrics_b = method_b_video_text_embedding(chunks, device)
+                all_embeddings.append(embeddings_b)
+                all_metrics.append(metrics_b)
+                st.success(f"Method B completed in {metrics_b['processing_time']:.2f}s")
+            
+            # Method C
+            with st.spinner("Processing Method C: LLM Description + Text..."):
+                embeddings_c, metrics_c = method_c_llm_text_embedding(chunks, text_model, device)
+                all_embeddings.append(embeddings_c)
+                all_metrics.append(metrics_c)
+                st.success(f"Method C completed in {metrics_c['processing_time']:.2f}s")
+            
+            # Display results
+            st.header("4. Performance Comparison")
+            
+            # Create metrics dataframe
+            df_metrics = pd.DataFrame(all_metrics)
+            
+            # Display metrics table
+            st.subheader("Processing Metrics")
+            st.dataframe(df_metrics, use_container_width=True)
+            
+            # Visualize metrics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric(
+                    "Method A: Processing Time",
+                    f"{metrics_a['processing_time']:.2f}s",
+                    delta=None
+                )
+                st.metric(
+                    "Avg Time/Chunk",
+                    f"{metrics_a['avg_time_per_chunk']:.3f}s"
+                )
+            
+            with col2:
+                st.metric(
+                    "Method B: Processing Time",
+                    f"{metrics_b['processing_time']:.2f}s",
+                    delta=f"{metrics_b['processing_time'] - metrics_a['processing_time']:.2f}s"
+                )
+                st.metric(
+                    "Avg Time/Chunk",
+                    f"{metrics_b['avg_time_per_chunk']:.3f}s"
+                )
+            
+            with col3:
+                st.metric(
+                    "Method C: Processing Time",
+                    f"{metrics_c['processing_time']:.2f}s",
+                    delta=f"{metrics_c['processing_time'] - metrics_a['processing_time']:.2f}s"
+                )
+                st.metric(
+                    "Avg Time/Chunk",
+                    f"{metrics_c['avg_time_per_chunk']:.3f}s"
+                )
+            
+            # Embedding quality metrics
+            st.subheader("Embedding Quality Metrics")
+            
+            similarities = compute_embedding_similarity(all_embeddings)
+            
+            quality_df = pd.DataFrame({
+                'Method': [m['method'] for m in all_metrics],
+                'Embedding Dimension': [m['embedding_dim'] for m in all_metrics],
+                'Avg Chunk Similarity': similarities
+            })
+            
+            st.dataframe(quality_df, use_container_width=True)
+            
+            st.info("""
+            **Interpretation:**
+            - **Processing Time**: Lower is faster
+            - **Embedding Dimension**: Higher may capture more information but uses more memory
+            - **Avg Chunk Similarity**: Measures consistency between consecutive chunks (0-1 scale)
+            """)
+            
+            # Summary
+            st.header("5. Summary & Recommendations")
+            
+            fastest_method = min(all_metrics, key=lambda x: x['processing_time'])
+            
+            st.success(f"**Fastest Method**: {fastest_method['method']} ({fastest_method['processing_time']:.2f}s)")
+            
+            st.markdown("""
+            ### Method Comparison:
+            
+            **Method A (Image + Text - CLIP)**
+            - ✅ Fast processing with sampled frames
+            - ✅ Good for static visual content
+            - ⚠️ May miss temporal dynamics
+            
+            **Method B (Video + Text - Multi-frame)**
+            - ✅ Better temporal understanding
+            - ✅ Captures motion and sequences
+            - ⚠️ Slower due to processing more frames
+            
+            **Method C (LLM Description + Text)**
+            - ✅ Fastest processing
+            - ✅ Semantic understanding through descriptions
+            - ⚠️ Quality depends on description accuracy (simplified in this demo)
+            """)
+            
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}")
+            st.info("Please check your internet connection (required for first-time model download) and try again")
+            import traceback
+            with st.expander("Error Details"):
+                st.code(traceback.format_exc())
+        finally:
+            # Cleanup
+            try:
+                os.unlink(video_path)
+            except:
+                pass
 
 else:
     st.info("👆 Please upload a video file to begin")

@@ -9,14 +9,14 @@ import pandas as pd
 from typing import List, Tuple, Dict
 import torch
 from PIL import Image
+import io
+import base64
 
 # Import embedding models
-try:
-    from transformers import CLIPProcessor, CLIPModel, VideoMAEImageProcessor, VideoMAEModel
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    st.error("Required libraries not installed. Please install requirements.txt")
-    st.stop()
+from transformers import CLIPProcessor, CLIPModel, VideoMAEImageProcessor, VideoMAEModel
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+import imagehash
 
 # Page configuration
 st.set_page_config(
@@ -27,14 +27,27 @@ st.set_page_config(
 
 st.title("🎥 Video Embedding Methods Comparison")
 st.markdown("""
-Compare three different approaches to embed video clips:
-- **Method A**: Image + Text Model (CLIP)
-- **Method B**: Video + Text Model (VideoMAE)
-- **Method C**: LLM Description + Text Model
+Compare two different approaches to embed video clips:
+- **CLIP**: Image + Text Model (CLIP with sampled frames)
+- **LLM**: Gemini 2.0 Flash + Text Embedding
 """)
 
 # Sidebar for configuration
 st.sidebar.header("Configuration")
+
+# Gemini API Key
+from dotenv import load_dotenv
+load_dotenv()  # Loads .env file into environment variables
+gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+print(gemini_api_key)
+
+# Similarity method selector for Method C
+similarity_method = st.sidebar.selectbox(
+    "LLM Similarity Filter",
+    options=["CLIP (Semantic)", "Perceptual Hashing (Fast)"],
+    index=0,
+    help="Choose how to filter similar frames in LLM method"
+)
 
 # Chunk duration selector
 chunk_duration = st.sidebar.slider(
@@ -86,7 +99,7 @@ def load_text_model():
 
 def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List[np.ndarray]]]:
     """
-    Extract frames from video in chunks
+    Extract frames from video in chunks (1 frame per second)
     
     Args:
         video_path: Path to video file
@@ -100,7 +113,7 @@ def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps
     
-    frames_per_chunk = fps * chunk_duration
+    frames_per_chunk = chunk_duration  # Now 1 frame per second
     chunks = []
     chunk_id = 0
     
@@ -112,16 +125,19 @@ def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List
         if not ret:
             break
         
-        # Convert BGR to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        current_chunk_frames.append(frame)
-        frame_count += 1
+        # Only capture 1 frame per second (every fps frames)
+        if frame_count % fps == 0:
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            current_chunk_frames.append(frame)
+            
+            # Check if we've completed a chunk
+            if len(current_chunk_frames) >= frames_per_chunk:
+                chunks.append((chunk_id, current_chunk_frames[:]))
+                current_chunk_frames = []
+                chunk_id += 1
         
-        # Check if we've completed a chunk
-        if len(current_chunk_frames) >= frames_per_chunk:
-            chunks.append((chunk_id, current_chunk_frames[:]))
-            current_chunk_frames = []
-            chunk_id += 1
+        frame_count += 1
     
     # Add remaining frames as final chunk if any
     if current_chunk_frames:
@@ -131,10 +147,10 @@ def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List
     return chunks, fps, duration
 
 
-def method_a_image_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]], 
-                                   clip_model, clip_processor, device: str) -> Tuple[List[np.ndarray], Dict]:
+def clip_embedding(chunks: List[Tuple[int, List[np.ndarray]]], 
+                   clip_model, clip_processor, device: str) -> Tuple[List[np.ndarray], Dict]:
     """
-    Method A: Extract key frames and embed using CLIP (image+text model)
+    CLIP Method: Extract key frames and embed using CLIP (image+text model)
     
     Args:
         chunks: List of (chunk_id, frames) tuples
@@ -149,15 +165,25 @@ def method_a_image_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]],
     embeddings = []
     
     clip_model = clip_model.to(device)
+    chunk_times = []  # Track processing time per chunk
     
     for chunk_id, frames in chunks:
+        chunk_start_time = time.time()
+        
         # Sample a few representative frames from the chunk
-        num_frames = len(frames)
-        sample_indices = np.linspace(0, num_frames - 1, min(5, num_frames), dtype=int)
-        sampled_frames = [frames[i] for i in sample_indices]
+        # num_frames = len(frames)
+        # sample_indices = np.linspace(0, num_frames - 1, min(5, num_frames), dtype=int)
+        # sampled_frames = [frames[i] for i in sample_indices]
         
         # Convert to PIL Images
-        pil_images = [Image.fromarray(frame) for frame in sampled_frames]
+        pil_images = [Image.fromarray(frame) for frame in frames]
+        
+        # Display frames used for this chunk
+        st.write(f"**Chunk {chunk_id}:** Using {len(pil_images)} sampled frames")
+        cols = st.columns(len(pil_images))
+        for idx, (col, img) in enumerate(zip(cols, pil_images)):
+            with col:
+                st.image(img, caption=f"Frame {idx}", width='stretch')
         
         # Process images
         inputs = clip_processor(images=pil_images, return_tensors="pt", padding=True)
@@ -170,89 +196,45 @@ def method_a_image_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]],
         # Average embeddings across sampled frames
         chunk_embedding = image_features.mean(dim=0).cpu().numpy()
         embeddings.append(chunk_embedding)
+        
+        # Track chunk processing time
+        chunk_end_time = time.time()
+        chunk_processing_time = chunk_end_time - chunk_start_time
+        chunk_times.append(chunk_processing_time)
+        st.write(f"⏱️ Chunk {chunk_id} processed in {chunk_processing_time:.2f}s")
+        st.markdown("---")
     
     end_time = time.time()
     
     metrics = {
-        "method": "A: Image + Text (CLIP)",
+        "method": "CLIP",
         "processing_time": end_time - start_time,
         "num_chunks": len(chunks),
         "embedding_dim": embeddings[0].shape[0] if embeddings else 0,
-        "avg_time_per_chunk": (end_time - start_time) / len(chunks) if chunks else 0
+        "avg_time_per_chunk": (end_time - start_time) / len(chunks) if chunks else 0,
+        "chunk_times": chunk_times,
+        "min_chunk_time": min(chunk_times) if chunk_times else 0,
+        "max_chunk_time": max(chunk_times) if chunk_times else 0
     }
     
     return embeddings, metrics
 
 
-def method_b_video_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]], 
-                                   device: str) -> Tuple[List[np.ndarray], Dict]:
+def llm_embedding(chunks: List[Tuple[int, List[np.ndarray]]], 
+                  text_model, device: str, gemini_api_key: str,
+                  similarity_method: str,
+                  clip_model=None, clip_processor=None) -> Tuple[List[np.ndarray], Dict]:
     """
-    Method B: Use a video+text model (simplified - using frame averaging as proxy)
-    
-    Args:
-        chunks: List of (chunk_id, frames) tuples
-        device: Device to use
-    
-    Returns:
-        List of embeddings and performance metrics
-    """
-    start_time = time.time()
-    embeddings = []
-    
-    # For this demo, we'll use CLIP on multiple frames to simulate video understanding
-    # In production, you'd use models like VideoMAE, X-CLIP, etc.
-    clip_model, clip_processor = load_clip_model()
-    clip_model = clip_model.to(device)
-    
-    for chunk_id, frames in chunks:
-        # Sample more frames for video-level understanding
-        num_frames = len(frames)
-        sample_indices = np.linspace(0, num_frames - 1, min(16, num_frames), dtype=int)
-        sampled_frames = [frames[i] for i in sample_indices]
-        
-        # Convert to PIL Images
-        pil_images = [Image.fromarray(frame) for frame in sampled_frames]
-        
-        # Process in batches
-        batch_size = 8
-        frame_embeddings = []
-        
-        for i in range(0, len(pil_images), batch_size):
-            batch = pil_images[i:i+batch_size]
-            inputs = clip_processor(images=batch, return_tensors="pt", padding=True)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                features = clip_model.get_image_features(**inputs)
-            frame_embeddings.append(features.cpu().numpy())
-        
-        # Concatenate and average
-        all_embeddings = np.vstack(frame_embeddings)
-        chunk_embedding = all_embeddings.mean(axis=0)
-        embeddings.append(chunk_embedding)
-    
-    end_time = time.time()
-    
-    metrics = {
-        "method": "B: Video + Text (Multi-frame CLIP)",
-        "processing_time": end_time - start_time,
-        "num_chunks": len(chunks),
-        "embedding_dim": embeddings[0].shape[0] if embeddings else 0,
-        "avg_time_per_chunk": (end_time - start_time) / len(chunks) if chunks else 0
-    }
-    
-    return embeddings, metrics
-
-
-def method_c_llm_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]], 
-                                 text_model, device: str) -> Tuple[List[np.ndarray], Dict]:
-    """
-    Method C: Use LLM to generate description, then embed with text model
+    LLM Method: Use Gemini 2.0 Flash to generate description from filtered frames, then embed with text model
     
     Args:
         chunks: List of (chunk_id, frames) tuples
         text_model: Text embedding model
         device: Device to use
+        gemini_api_key: Gemini API key
+        similarity_method: "CLIP (Semantic)" or "Perceptual Hashing (Fast)"
+        clip_model: CLIP model for similarity filtering (optional)
+        clip_processor: CLIP processor for similarity filtering (optional)
     
     Returns:
         List of embeddings and performance metrics
@@ -260,29 +242,176 @@ def method_c_llm_text_embedding(chunks: List[Tuple[int, List[np.ndarray]]],
     start_time = time.time()
     embeddings = []
     
-    # For this demo, we'll generate simple descriptions based on visual features
-    # In production, you'd use an actual VLM like BLIP, LLaVA, GPT-4V, etc.
+    # Configure Gemini
+    if not gemini_api_key:
+        st.warning("Gemini API key not provided. Using placeholder descriptions for LLM method.")
+        use_gemini = False
+    else:
+        try:
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-lite')
+            use_gemini = True
+        except Exception as e:
+            st.warning(f"Failed to initialize Gemini: {e}. Using placeholder descriptions.")
+            use_gemini = False
+    
+    # Determine similarity method based on user selection
+    use_clip_similarity = similarity_method == "CLIP (Semantic)" and clip_model is not None and clip_processor is not None
+    
+    if use_clip_similarity:
+        similarity_threshold = 0.9  # For CLIP cosine similarity
+    else:
+        perceptual_threshold = 6  # ~10% of 64-bit hash for dhash
+    
+    chunk_times = []  # Track processing time per chunk
     
     for chunk_id, frames in chunks:
-        # Sample a middle frame for description
-        mid_frame = frames[len(frames) // 2]
+        chunk_start_time = time.time()  # Start timing this chunk
         
-        # Generate a simple description (in production, use actual LLM/VLM)
-        # For demo purposes, we'll use a placeholder description
-        description = f"Video chunk {chunk_id}: A video segment with temporal motion and visual content"
+        # Step 1: Filter ALL frames by similarity (not just sampled ones)
+        filtered_frames = frames[:]
         
-        # Embed the description
+        # if use_clip_similarity:
+        #     # Use CLIP for similarity filtering on ALL frames
+        #     clip_model_temp = clip_model.to(device)
+            
+        #     for i, frame in enumerate(frames):
+        #         if i == 0:
+        #             # Always include first frame
+        #             filtered_frames.append(frame)
+        #         else:
+        #             # Compare with last filtered frame
+        #             last_frame = filtered_frames[-1]
+                    
+        #             # Convert to PIL and get embeddings
+        #             pil_frame1 = Image.fromarray(last_frame)
+        #             pil_frame2 = Image.fromarray(frame)
+                    
+        #             inputs = clip_processor(images=[pil_frame1, pil_frame2], return_tensors="pt", padding=True)
+        #             inputs = {k: v.to(device) for k, v in inputs.items()}
+                    
+        #             with torch.no_grad():
+        #                 features = clip_model_temp.get_image_features(**inputs)
+                    
+        #             # Compute cosine similarity
+        #             emb1 = features[0].cpu().numpy()
+        #             emb2 = features[1].cpu().numpy()
+        #             similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+                    
+        #             # Add frame if similarity < threshold (i.e., sufficiently different)
+        #             if similarity < similarity_threshold:
+        #                 filtered_frames.append(frame)
+        # else:
+        #     # Use perceptual hashing for similarity on ALL frames
+        #     for i, frame in enumerate(frames):
+        #         if i == 0:
+        #             filtered_frames.append(frame)
+        #         else:
+        #             last_frame = filtered_frames[-1]
+                    
+        #             # Compute perceptual hashes
+        #             pil_frame1 = Image.fromarray(last_frame)
+        #             pil_frame2 = Image.fromarray(frame)
+                    
+        #             hash1 = imagehash.dhash(pil_frame1)
+        #             hash2 = imagehash.dhash(pil_frame2)
+                    
+        #             # Hamming distance
+        #             distance = hash1 - hash2
+                    
+        #             # Add frame if sufficiently different
+        #             if distance > perceptual_threshold:
+        #                 filtered_frames.append(frame)
+        
+        # Step 2: Limit to max 50 frames
+        # if len(filtered_frames) > 50:
+        #     # Resample to 50 frames
+        #     indices = np.linspace(0, len(filtered_frames) - 1, 50, dtype=int)
+        #     filtered_frames = [filtered_frames[i] for i in indices]
+        
+        # Display filtered frames for this chunk
+        st.write(f"**Chunk {chunk_id}:** Filtered to {len(filtered_frames)} distinct frames (from {len(frames)} total)")
+        if len(filtered_frames) > 0:
+            # Display ALL filtered frames (up to 50)
+            # Show in rows of 10 for better layout
+            frames_per_row = 10
+            for row_start in range(0, len(filtered_frames), frames_per_row):
+                row_end = min(row_start + frames_per_row, len(filtered_frames))
+                row_frames = filtered_frames[row_start:row_end]
+                
+                cols = st.columns(len(row_frames))
+                for idx, (col, frame) in enumerate(zip(cols, row_frames)):
+                    with col:
+                        pil_img = Image.fromarray(frame)
+                        frame_num = row_start + idx
+                        st.image(pil_img, caption=f"F{frame_num}", width='stretch')
+        
+        # Step 3: Generate description using Gemini
+        if use_gemini and filtered_frames:
+            try:
+                # Convert frames to PIL Images
+                pil_images = [Image.fromarray(frame) for frame in filtered_frames]
+                
+                # Placeholder prompt - YOU WILL FILL THIS IN
+                prompt = f"""
+                    Provide a detailed description of a video shot based on the given frame images. Focus on creating a cohesive narrative of the entire shot rather than describing each frame individually.
+
+                    Incorporate the following elements in your description: 
+                    1. Visual elements:
+                    - Describe all visible objects, text, and characters in detail.
+                    - For any characters present, include:
+                        • Age
+                        • Emotional expressions
+                        • Clothing and accessories
+                        • Physical appearance
+                        • Any actions, movements or gestures
+
+                    2. Setting and atmosphere:
+                    - Provide details about the time, location, and overall ambiance.
+                    - Mention any relevant background elements that contribute to the scene.
+
+                    Skip the preamble; go straight into the description."""
+                
+                # Send to Gemini
+                response = model.generate_content([prompt] + pil_images)
+                description = response.text
+                
+                # Display the generated description
+                st.success("✅ Gemini Description:")
+                st.write(description)
+                st.markdown("---")
+                
+            except Exception as e:
+                st.warning(f"Gemini API error for chunk {chunk_id}: {e}")
+                description = f"Video chunk {chunk_id}: A video segment with {len(filtered_frames)} distinct frames"
+        else:
+            # Fallback description
+            description = f"Video chunk {chunk_id}: A video segment with {len(filtered_frames)} distinct frames"
+            if not use_gemini:
+                st.info(f"📝 Fallback description: {description}")
+        
+        # Step 4: Embed the description
         embedding = text_model.encode(description)
         embeddings.append(embedding)
+        
+        # Track chunk processing time
+        chunk_end_time = time.time()
+        chunk_processing_time = chunk_end_time - chunk_start_time
+        chunk_times.append(chunk_processing_time)
+        st.write(f"⏱️ Chunk {chunk_id} processed in {chunk_processing_time:.2f}s")
+        st.markdown("---")
     
     end_time = time.time()
     
     metrics = {
-        "method": "C: LLM Description + Text Embedding",
+        "method": "LLM",
         "processing_time": end_time - start_time,
         "num_chunks": len(chunks),
         "embedding_dim": embeddings[0].shape[0] if embeddings else 0,
-        "avg_time_per_chunk": (end_time - start_time) / len(chunks) if chunks else 0
+        "avg_time_per_chunk": (end_time - start_time) / len(chunks) if chunks else 0,
+        "chunk_times": chunk_times,  # Add detailed per-chunk times
+        "min_chunk_time": min(chunk_times) if chunk_times else 0,
+        "max_chunk_time": max(chunk_times) if chunk_times else 0
     }
     
     return embeddings, metrics
@@ -355,28 +484,23 @@ if uploaded_file is not None:
             all_embeddings = []
             all_metrics = []
             
-            # Method A
-            with st.spinner("Processing Method A: Image + Text (CLIP)..."):
-                embeddings_a, metrics_a = method_a_image_text_embedding(
+            # CLIP Method
+            with st.spinner("Processing CLIP Method..."):
+                embeddings_clip, metrics_clip = clip_embedding(
                     chunks, clip_model, clip_processor, device
                 )
-                all_embeddings.append(embeddings_a)
-                all_metrics.append(metrics_a)
-                st.success(f"Method A completed in {metrics_a['processing_time']:.2f}s")
+                all_embeddings.append(embeddings_clip)
+                all_metrics.append(metrics_clip)
+                st.success(f"CLIP method completed in {metrics_clip['processing_time']:.2f}s")
             
-            # Method B
-            with st.spinner("Processing Method B: Video + Text (Multi-frame)..."):
-                embeddings_b, metrics_b = method_b_video_text_embedding(chunks, device)
-                all_embeddings.append(embeddings_b)
-                all_metrics.append(metrics_b)
-                st.success(f"Method B completed in {metrics_b['processing_time']:.2f}s")
-            
-            # Method C
-            with st.spinner("Processing Method C: LLM Description + Text..."):
-                embeddings_c, metrics_c = method_c_llm_text_embedding(chunks, text_model, device)
-                all_embeddings.append(embeddings_c)
-                all_metrics.append(metrics_c)
-                st.success(f"Method C completed in {metrics_c['processing_time']:.2f}s")
+            # LLM Method
+            with st.spinner("Processing LLM Method..."):
+                embeddings_llm, metrics_llm = llm_embedding(
+                    chunks, text_model, device, gemini_api_key, similarity_method, clip_model, clip_processor
+                )
+                all_embeddings.append(embeddings_llm)
+                all_metrics.append(metrics_llm)
+                st.success(f"LLM method completed in {metrics_llm['processing_time']:.2f}s")
             
             # Display results
             st.header("4. Performance Comparison")
@@ -386,42 +510,31 @@ if uploaded_file is not None:
             
             # Display metrics table
             st.subheader("Processing Metrics")
-            st.dataframe(df_metrics, use_container_width=True)
+            st.dataframe(df_metrics, width='stretch')
             
             # Visualize metrics
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             
             with col1:
                 st.metric(
-                    "Method A: Processing Time",
-                    f"{metrics_a['processing_time']:.2f}s",
+                    "CLIP: Processing Time",
+                    f"{metrics_clip['processing_time']:.2f}s",
                     delta=None
                 )
                 st.metric(
                     "Avg Time/Chunk",
-                    f"{metrics_a['avg_time_per_chunk']:.3f}s"
+                    f"{metrics_clip['avg_time_per_chunk']:.3f}s"
                 )
             
             with col2:
                 st.metric(
-                    "Method B: Processing Time",
-                    f"{metrics_b['processing_time']:.2f}s",
-                    delta=f"{metrics_b['processing_time'] - metrics_a['processing_time']:.2f}s"
+                    "LLM: Processing Time",
+                    f"{metrics_llm['processing_time']:.2f}s",
+                    delta=f"{metrics_llm['processing_time'] - metrics_clip['processing_time']:.2f}s"
                 )
                 st.metric(
                     "Avg Time/Chunk",
-                    f"{metrics_b['avg_time_per_chunk']:.3f}s"
-                )
-            
-            with col3:
-                st.metric(
-                    "Method C: Processing Time",
-                    f"{metrics_c['processing_time']:.2f}s",
-                    delta=f"{metrics_c['processing_time'] - metrics_a['processing_time']:.2f}s"
-                )
-                st.metric(
-                    "Avg Time/Chunk",
-                    f"{metrics_c['avg_time_per_chunk']:.3f}s"
+                    f"{metrics_llm['avg_time_per_chunk']:.3f}s"
                 )
             
             # Embedding quality metrics
@@ -435,7 +548,7 @@ if uploaded_file is not None:
                 'Avg Chunk Similarity': similarities
             })
             
-            st.dataframe(quality_df, use_container_width=True)
+            st.dataframe(quality_df, width='stretch')
             
             st.info("""
             **Interpretation:**
@@ -454,20 +567,19 @@ if uploaded_file is not None:
             st.markdown("""
             ### Method Comparison:
             
-            **Method A (Image + Text - CLIP)**
-            - ✅ Fast processing with sampled frames
+            **CLIP Method**
+            - ✅ Fast processing with sampled frames (5 frames per chunk)
             - ✅ Good for static visual content
-            - ⚠️ May miss temporal dynamics
+            - ✅ Simple and efficient
+            - ⚠️ May miss temporal dynamics between sampled frames
             
-            **Method B (Video + Text - Multi-frame)**
-            - ✅ Better temporal understanding
-            - ✅ Captures motion and sequences
-            - ⚠️ Slower due to processing more frames
-            
-            **Method C (LLM Description + Text)**
-            - ✅ Fastest processing
-            - ✅ Semantic understanding through descriptions
-            - ⚠️ Quality depends on description accuracy (simplified in this demo)
+            **LLM Method (Gemini 2.0 Flash)**
+            - ✅ Uses Gemini 2.0 Flash for rich video understanding
+            - ✅ Filters frames using CLIP or perceptual hashing (user-selectable)
+            - ✅ Captures scene changes and distinct moments automatically
+            - ✅ Semantic understanding through AI-generated descriptions
+            - ⚠️ Requires Gemini API key and may have API costs
+            - ⚠️ Slower processing due to frame filtering and API calls
             """)
             
         except Exception as e:

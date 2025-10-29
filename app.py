@@ -1,3 +1,4 @@
+from altair import Step
 import streamlit as st
 import tempfile
 import os
@@ -39,7 +40,6 @@ st.sidebar.header("Configuration")
 from dotenv import load_dotenv
 load_dotenv()  # Loads .env file into environment variables
 gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-print(gemini_api_key)
 
 # Similarity method selector for Method C
 similarity_method = st.sidebar.selectbox(
@@ -57,6 +57,16 @@ chunk_duration = st.sidebar.slider(
     value=5,
     step=1,
     help="Duration of each video chunk to embed"
+)
+
+# Frame extraction interval
+frame_interval = st.sidebar.slider(
+    "Frame Interval (seconds)",
+    min_value=0.1,
+    max_value=1.0,
+    value=1.0,
+    step=0.1,
+    help="Extract 1 frame every X seconds (e.g., 0.5 = every 0.5s, 1.0 = every second)"
 )
 
 # Model selection
@@ -97,13 +107,14 @@ def load_text_model():
         raise
 
 
-def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List[np.ndarray]]]:
+def extract_frames(video_path: str, chunk_duration: int, frame_interval: float = 1.0) -> List[Tuple[int, List[np.ndarray]]]:
     """
-    Extract frames from video in chunks (1 frame per second)
+    Extract frames from video in chunks
     
     Args:
         video_path: Path to video file
         chunk_duration: Duration of each chunk in seconds
+        frame_interval: Extract 1 frame every X seconds (e.g., 0.5 = every 0.5s, 1.0 = every second, 2.0 = every 2 seconds)
     
     Returns:
         List of (chunk_id, frames) tuples
@@ -113,20 +124,24 @@ def extract_frames(video_path: str, chunk_duration: int) -> List[Tuple[int, List
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps
     
-    frames_per_chunk = chunk_duration  # Now 1 frame per second
+    # Calculate frames per chunk based on interval
+    frames_per_chunk = int(chunk_duration / frame_interval)
     chunks = []
     chunk_id = 0
     
     frame_count = 0
     current_chunk_frames = []
     
+    # Calculate frame step (how many frames to skip between captures)
+    frame_step = int(fps * frame_interval)
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Only capture 1 frame per second (every fps frames)
-        if frame_count % fps == 0:
+        # Capture frame at specified interval
+        if frame_count % frame_step == 0:
             # Convert BGR to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             current_chunk_frames.append(frame)
@@ -258,10 +273,8 @@ def llm_embedding(chunks: List[Tuple[int, List[np.ndarray]]],
     # Determine similarity method based on user selection
     use_clip_similarity = similarity_method == "CLIP (Semantic)" and clip_model is not None and clip_processor is not None
     
-    if use_clip_similarity:
-        similarity_threshold = 0.9  # For CLIP cosine similarity
-    else:
-        perceptual_threshold = 6  # ~10% of 64-bit hash for dhash
+    similarity_threshold = 0.9  # For CLIP cosine similarity
+    perceptual_threshold = 6  # ~10% of 64-bit hash for dhash
     
     chunk_times = []  # Track processing time per chunk
     
@@ -302,32 +315,32 @@ def llm_embedding(chunks: List[Tuple[int, List[np.ndarray]]],
         #             if similarity < similarity_threshold:
         #                 filtered_frames.append(frame)
         # else:
-        #     # Use perceptual hashing for similarity on ALL frames
-        #     for i, frame in enumerate(frames):
-        #         if i == 0:
+        # Use perceptual hashing for similarity on ALL frames
+        # for i, frame in enumerate(frames):
+        #     if i == 0:
+        #         filtered_frames.append(frame)
+        #     else:
+        #         last_frame = filtered_frames[-1]
+                
+        #         # Compute perceptual hashes
+        #         pil_frame1 = Image.fromarray(last_frame)
+        #         pil_frame2 = Image.fromarray(frame)
+                
+        #         hash1 = imagehash.dhash(pil_frame1)
+        #         hash2 = imagehash.dhash(pil_frame2)
+                
+        #         # Hamming distance
+        #         distance = hash1 - hash2
+                
+        #         # Add frame if sufficiently different
+        #         if distance > perceptual_threshold:
         #             filtered_frames.append(frame)
-        #         else:
-        #             last_frame = filtered_frames[-1]
-                    
-        #             # Compute perceptual hashes
-        #             pil_frame1 = Image.fromarray(last_frame)
-        #             pil_frame2 = Image.fromarray(frame)
-                    
-        #             hash1 = imagehash.dhash(pil_frame1)
-        #             hash2 = imagehash.dhash(pil_frame2)
-                    
-        #             # Hamming distance
-        #             distance = hash1 - hash2
-                    
-        #             # Add frame if sufficiently different
-        #             if distance > perceptual_threshold:
-        #                 filtered_frames.append(frame)
-        
-        # Step 2: Limit to max 50 frames
-        # if len(filtered_frames) > 50:
-        #     # Resample to 50 frames
-        #     indices = np.linspace(0, len(filtered_frames) - 1, 50, dtype=int)
-        #     filtered_frames = [filtered_frames[i] for i in indices]
+
+        # Step 2: Limit to max frames
+        max_frames = 20
+        if len(filtered_frames) > max_frames:
+            indices = np.linspace(0, len(filtered_frames) - 1, max_frames, dtype=int)
+            filtered_frames = [filtered_frames[i] for i in indices]
         
         # Display filtered frames for this chunk
         st.write(f"**Chunk {chunk_id}:** Filtered to {len(filtered_frames)} distinct frames (from {len(frames)} total)")
@@ -468,8 +481,8 @@ if uploaded_file is not None:
         try:
             # Extract frames
             with st.spinner("Extracting video frames..."):
-                chunks, fps, duration = extract_frames(video_path, chunk_duration)
-                st.success(f"Extracted {len(chunks)} chunks of {chunk_duration}s each")
+                chunks, fps, duration = extract_frames(video_path, chunk_duration, frame_interval)
+                st.success(f"Extracted {len(chunks)} chunks of {chunk_duration}s each (1 frame every {frame_interval}s)")
             
             # Load models
             with st.spinner("Loading models..."):
